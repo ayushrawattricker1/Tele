@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+
+.env
+
+*.session
+*.session-journal
+
+data/
+telegram_sessions/
+message_files/
