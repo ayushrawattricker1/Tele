@@ -34,10 +34,11 @@ app.secret_key = os.environ.get(
 # Telegram API credentials
 # API ID is included here; keep the API HASH in Render Environment Variables.
 API_ID = os.environ.get("TELEGRAM_API_ID", "37618132").strip()
+# Keep API HASH in Render Environment Variables; never commit the secret to GitHub.
 API_HASH = os.environ.get("TELEGRAM_API_HASH", "").strip()
 
 BASE_DIR = Path(__file__).resolve().parent
-SESSION_DIR = BASE_DIR / "telegram_sessions"
+SESSION_DIR = Path(os.environ.get("TELEGRAM_DATA_DIR", str(BASE_DIR / "telegram_sessions"))) / "telegram_sessions"
 UPLOAD_DIR = BASE_DIR / "message_files"
 
 SESSION_DIR.mkdir(exist_ok=True)
