@@ -14,6 +14,7 @@ from flask import (
     flash, jsonify
 )
 from telethon import TelegramClient
+from telethon.tl.functions.auth import ExportLoginTokenRequest
 from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
@@ -30,7 +31,9 @@ app.secret_key = os.environ.get(
     "FLASK_SECRET_KEY", secrets.token_hex(32)
 )
 
-API_ID = os.environ.get("TELEGRAM_API_ID", "").strip()
+# Telegram API credentials
+# API ID is included here; keep the API HASH in Render Environment Variables.
+API_ID = os.environ.get("TELEGRAM_API_ID", "37618132").strip()
 API_HASH = os.environ.get("TELEGRAM_API_HASH", "").strip()
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -48,8 +51,8 @@ MAX_INTERVAL = 3600
 tasks = {}
 task_lock = threading.Lock()
 
-# Pending login codes: phone -> phone_code_hash
-pending_logins = {}
+# Pending QR logins: login_id -> {client, expires, status}
+pending_qr_logins = {}
 login_lock = threading.Lock()
 
 
@@ -59,10 +62,12 @@ def run_async(coro):
 
 
 def check_api_config():
-    if not API_ID or not API_HASH:
+    if not API_ID:
+        raise ValueError("Telegram API ID is missing.")
+    if not API_HASH:
         raise ValueError(
-            "Set TELEGRAM_API_ID and TELEGRAM_API_HASH "
-            "in your hosting environment first."
+            "Telegram API HASH is missing. Set TELEGRAM_API_HASH "
+            "in your Render Environment Variables."
         )
     try:
         return int(API_ID)
@@ -107,46 +112,88 @@ def add_log(task_id, message):
             task["logs"] = task["logs"][-300:]
 
 
-async def request_login_code(phone):
+async def create_qr_login():
+    """Create a Telegram QR login session without asking for a phone number."""
     api_id = check_api_config()
-    client = TelegramClient(session_name(phone), api_id, API_HASH)
+    login_id = secrets.token_urlsafe(12)
+    client = TelegramClient(session_name("qr_" + login_id), api_id, API_HASH)
     await client.connect()
-    try:
-        if await client.is_user_authorized():
-            return {"already_logged_in": True}
-        sent = await client.send_code_request(phone)
-        return {
-            "already_logged_in": False,
-            "phone_code_hash": sent.phone_code_hash
-        }
-    finally:
+
+    if await client.is_user_authorized():
+        me = await client.get_me()
         await client.disconnect()
+        return {
+            "already_logged_in": True,
+            "username": me.username or "",
+            "login_id": login_id,
+        }
+
+    login = await client.qr_login()
+    with login_lock:
+        pending_qr_logins[login_id] = {
+            "client": client,
+            "login": login,
+            "created": time.time(),
+            "status": "waiting",
+        }
+
+    return {
+        "already_logged_in": False,
+        "login_id": login_id,
+        "url": login.url,
+        "expires": login.expires,
+    }
 
 
-async def complete_login(phone, code, code_hash, password=None):
-    api_id = check_api_config()
-    client = TelegramClient(session_name(phone), api_id, API_HASH)
-    await client.connect()
+async def finish_qr_login(login_id):
+    with login_lock:
+        item = pending_qr_logins.get(login_id)
+
+    if not item:
+        raise ValueError("QR login session not found or expired.")
+
+    client = item["client"]
+    login = item["login"]
+
     try:
-        if await client.is_user_authorized():
-            return {"ok": True, "message": "Account is already logged in."}
-
-        if password:
-            await client.sign_in(password=password)
-        else:
-            await client.sign_in(
-                phone=phone,
-                code=code,
-                phone_code_hash=code_hash
-            )
+        await login.wait()
 
         me = await client.get_me()
+        username = me.username or "account"
+
+        with login_lock:
+            pending_qr_logins.pop(login_id, None)
+
         return {
             "ok": True,
-            "message": "Login successful: @" + (me.username or "account")
+            "message": "Login successful: @" + username,
         }
+    except Exception:
+        with login_lock:
+            pending_qr_logins.pop(login_id, None)
+        raise
     finally:
-        await client.disconnect()
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+
+def qr_status(login_id):
+    with login_lock:
+        item = pending_qr_logins.get(login_id)
+
+    if not item:
+        return {"status": "not_found"}
+
+    age = time.time() - item["created"]
+    if age > 180:
+        return {"status": "expired"}
+
+    return {
+        "status": "waiting",
+        "login_id": login_id,
+    }
 
 
 async def send_task_messages(task_id, account_ids, recipient,
@@ -331,23 +378,52 @@ footer { text-align:center;padding:10px 20px 35px;color:var(--muted);font-size:1
 
 <div class="grid">
 <section class="panel">
-<h2>1. Add Telegram Account</h2>
-<p class="muted">Use your own account. The login code is sent by Telegram.
-Never share your OTP or 2-Step Verification password.</p>
-<form method="post" action="/login/code">
-<label>Phone number with country code</label>
-<input name="phone" placeholder="+91..." required autocomplete="tel">
-<button type="submit">Request Login Code</button>
+<h2>1. Telegram QR Login</h2>
+<p class="muted">
+No phone number or OTP is entered here. Generate a QR code and scan it
+from Telegram on the account you want to authorize.
+</p>
+<form method="post" action="/login/qr">
+<button type="submit">Generate Telegram QR</button>
 </form>
-<form method="post" action="/login/verify">
-<label>Phone number used above</label>
-<input name="phone" placeholder="+91..." required>
-<label>Telegram login code</label>
-<input name="code" placeholder="Code from Telegram">
-<label>2-Step Verification password (if requested)</label>
-<input name="password" type="password" placeholder="Optional">
-<button type="submit" class="success">Verify / Finish Login</button>
-</form>
+
+{% if qr_login %}
+<div class="task" style="margin-top:16px">
+<strong>Scan this QR with Telegram</strong>
+<p class="muted">Telegram → Settings → Devices → Link Desktop Device</p>
+<div id="qrBox" style="text-align:center;margin:15px 0">
+<img
+  alt="Telegram QR Login"
+  style="max-width:280px;width:100%;background:white;padding:12px;border-radius:12px"
+  src="https://api.qrserver.com/v1/create-qr-code/?size=280x280&data={{ qr_login.url|urlencode }}"
+>
+</div>
+<p class="muted" id="qrStatus">Waiting for QR scan...</p>
+<script>
+(async function pollQR() {
+  const box = document.getElementById("qrStatus");
+  try {
+    const r = await fetch("/login/qr/status/{{ qr_login.login_id }}");
+    const d = await r.json();
+    if (d.status === "success") {
+      box.textContent = "Login successful. Reloading...";
+      setTimeout(() => location.reload(), 800);
+      return;
+    }
+    if (d.status === "expired" || d.status === "not_found") {
+      box.textContent = "QR expired. Generate a new QR code.";
+      return;
+    }
+    box.textContent = "Waiting for QR scan...";
+    setTimeout(pollQR, 2000);
+  } catch (e) {
+    box.textContent = "Checking login status...";
+    setTimeout(pollQR, 3000);
+  }
+})();
+</script>
+</div>
+{% endif %}
 </section>
 
 <section class="panel">
@@ -458,8 +534,25 @@ def home():
             }
             for task_id, item in reversed(list(tasks.items()))
         ]
+    qr_login = None
+    qr_id = request.args.get("qr_login", "").strip()
+    if qr_id:
+        with login_lock:
+            item = pending_qr_logins.get(qr_id)
+        if item:
+            try:
+                qr_login = {
+                    "login_id": qr_id,
+                    "url": item["login"].url,
+                }
+            except Exception:
+                qr_login = None
+
     return render_template_string(
-        PAGE, accounts=available_accounts(), task_list=task_list
+        PAGE,
+        accounts=available_accounts(),
+        task_list=task_list,
+        qr_login=qr_login,
     )
 
 
@@ -515,6 +608,39 @@ def login_verify():
     except Exception as exc:
         flash(f"Login error: {exc}")
     return redirect(url_for("home"))
+
+
+@app.route("/login/qr", methods=["POST"])
+def login_qr():
+    try:
+        result = run_async(create_qr_login())
+        if result.get("already_logged_in"):
+            flash("This account is already logged in.")
+            return redirect(url_for("home"))
+
+        return redirect(
+            url_for("home", qr_login=result["login_id"])
+        )
+    except Exception as exc:
+        flash(f"Could not create QR login: {exc}")
+        return redirect(url_for("home"))
+
+
+@app.route("/login/qr/status/<login_id>", methods=["GET"])
+def login_qr_status(login_id):
+    status = qr_status(login_id)
+
+    if status["status"] == "waiting":
+        try:
+            result = run_async(finish_qr_login(login_id))
+            return jsonify({"status": "success", **result})
+        except Exception as exc:
+            message = str(exc)
+            if "wait" in message.lower() or "timeout" in message.lower():
+                return jsonify({"status": "waiting"})
+            return jsonify({"status": "error", "error": message}), 400
+
+    return jsonify(status)
 
 
 @app.route("/task/start", methods=["POST"])
