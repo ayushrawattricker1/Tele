@@ -38,11 +38,15 @@ API_ID = os.environ.get("TELEGRAM_API_ID", "37618132").strip()
 API_HASH = os.environ.get("TELEGRAM_API_HASH", "").strip()
 
 BASE_DIR = Path(__file__).resolve().parent
-SESSION_DIR = Path(os.environ.get("TELEGRAM_DATA_DIR", str(BASE_DIR / "telegram_sessions"))) / "telegram_sessions"
+if os.environ.get("TELEGRAM_DATA_DIR"):
+    SESSION_DIR = Path(os.environ["TELEGRAM_DATA_DIR"]).expanduser()
+else:
+    SESSION_DIR = BASE_DIR / "telegram_sessions"
+
 UPLOAD_DIR = BASE_DIR / "message_files"
 
-SESSION_DIR.mkdir(exist_ok=True)
-UPLOAD_DIR.mkdir(exist_ok=True)
+SESSION_DIR.mkdir(parents=True, exist_ok=True)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_FILE_BYTES = 1_000_000
 MIN_INTERVAL = 1
